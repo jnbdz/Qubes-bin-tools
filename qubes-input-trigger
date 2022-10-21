@@ -1,0 +1,154 @@
+#!/usr/bin/python3
+#
+# Trigger start qubes-input-* services for input mouse/key devices.
+# Used at dom0/GuiVM startup with real GPU passthrough (sys-gui-gpu)
+
+import argparse
+import subprocess
+import os
+import sys
+from stat import *
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--all",
+        required=False,
+        action="store_true"
+    )
+    parser.add_argument(
+        "--action",
+        required=False
+    )
+    parser.add_argument(
+        "--event",
+        required=False
+    )
+    parser.add_argument(
+        "--dom0",
+        required=False,
+        action="store_true",
+        default=os.path.exists('/etc/qubes-release'),
+    )
+    return parser.parse_args()
+
+
+def get_service_name(udevreturn, input_dev):
+    service = None
+    if (
+            ('ID_INPUT_TABLET' in udevreturn) or
+            ('ID_INPUT_TOUCHSCREEN' in udevreturn) or
+            ('ID_INPUT_TOUCHPAD' in udevreturn) or
+            ('QEMU_USB_Tablet' in udevreturn)
+    ) and 'ID_INPUT_KEY' not in udevreturn:
+        service = 'qubes-input-sender-tablet'
+    elif 'ID_INPUT_MOUSE' in udevreturn and 'ID_INPUT_KEY' not in udevreturn:
+        service = 'qubes-input-sender-mouse'
+    elif 'ID_INPUT_KEY' in udevreturn and 'ID_INPUT_MOUSE' not in udevreturn:
+        service = 'qubes-input-sender-keyboard'
+    elif 'ID_INPUT_MOUSE' in udevreturn and 'ID_INPUT_KEY' in udevreturn:
+        service = 'qubes-input-sender-keyboard-mouse'
+
+    if service:
+        service = '{}@{}.service'.format(service, input_dev)
+
+    return service
+
+
+def handle_service(service, action):
+    retcode = subprocess.call(
+        ["/bin/systemctl", "is-active", "--quiet", "service", service])
+    if action == "add":
+        systemctl_action = "start"
+        # Ignore if service is already started
+        if retcode == 0:
+            return
+    elif action == "remove":
+        systemctl_action = "stop"
+        # Ignore if service is not active
+        if retcode != 0:
+            return
+    else:
+        print("Unknown action: %s" % action)
+        sys.exit(1)
+
+    sudo = []
+    if os.getuid() != 0:
+        sudo = ["sudo"]
+
+    subprocess.call(
+        sudo + ["/bin/systemctl", "--no-block", systemctl_action, service])
+
+
+def handle_event(input_dev, action, dom0):
+    udevreturn = None
+    if 'event' in input_dev:  # if filename contains 'event'
+        if action == "add":
+            eventFile = os.path.join("/dev/input", input_dev)
+            if not os.path.exists(eventFile):
+                print("Cannot find event file: %s" % eventFile)
+                sys.exit(1)
+            if S_ISCHR(os.stat(eventFile).st_mode) != 0:  # is character device?
+                udevreturn = subprocess.check_output([
+                    "udevadm", "info", "--query=property",
+                    "--name=" + eventFile]).decode()
+                if 'ID_TYPE=video' in udevreturn:
+                    return
+                # The ID_SERIAL here corresponds to qemu-emulated tablet
+                # device for HVM which is static. It allows to attach another
+                # tablet for example when using KVM for tests. Depending on
+                # QEMU version, the device may look different. But it will
+                # always be the first bus, either on 00:04.0 or 00:05.0.
+                if ('ID_PATH=pci-0000:00:04.0-usb-0:1:1.0' in udevreturn or \
+                    'ID_PATH=pci-0000:00:05.0-usb-0:1:1.0' in udevreturn) and \
+                        'ID_SERIAL=QEMU_QEMU_USB_Tablet_' in udevreturn:
+                    return
+                if '/devices/virtual/' in udevreturn and dom0:
+                    return
+                # We exclude in sys-usb ID_PATH=acpi-* and ID_PATH=platform-*
+                # which can correspond to power-switch buttons. By default, HVM
+                # exposes some so there is no point for adding input devices
+                # into dom0 from those. This is only pertinent in the case
+                # of dom0 key devices to sys-gui-gpu
+                if 'ID_PATH=acpi-' in udevreturn and not dom0:
+                    return
+                if 'ID_PATH=platform-' in udevreturn and not dom0:
+                    return
+        elif action == "remove":
+            # on remove action we use information passed through
+            # env by udev
+            udevreturn = os.environ
+        else:
+            print("Unknown action: %s" % action)
+            sys.exit(1)
+
+        service = get_service_name(udevreturn, input_dev)
+        if service:
+            handle_service(service, action)
+
+
+def handle_all_events(dom0):
+    eventFiles = os.listdir("/dev/input")
+    for input_dev in eventFiles:
+        handle_event(input_dev, "add", dom0)
+
+
+def main():
+    args = get_args()
+
+    if not args.all and not args.event:
+        print("Please provide at least input event name or all option")
+        sys.exit(1)
+
+    if args.event and not args.action:
+        print("Please provide action to perform: add/remove")
+
+    if args.all:
+        handle_all_events(args.dom0)
+    else:
+        handle_event(args.event, args.action, args.dom0)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
